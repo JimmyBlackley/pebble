@@ -15,6 +15,7 @@ pub mod promise;
 pub mod query;
 pub mod resources;
 pub mod schedule;
+pub mod stream;
 pub mod system;
 pub mod system_param;
 
