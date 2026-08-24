@@ -1,4 +1,10 @@
-use crate::graphics::render::{compute_pass::ComputePass, render_pass::RenderPass, targets::Pass};
+use crate::graphics::{
+    pipeline::buffers::Buffer,
+    render::{
+        compute_pass::ComputePass, render_pass::RenderPass, targets::Pass,
+        timestamps::GpuTimestamps,
+    },
+};
 
 /// The acquired swapchain frame for this tick — access it via
 /// [`CurrentFrame::active`], not directly.
@@ -44,6 +50,26 @@ impl Frame {
     /// Begins a render pass for `pass`'s color/depth targets — an
     /// unattached color target falls back to the swapchain's own view.
     pub fn begin<'a>(&'a mut self, pass: Pass) -> RenderPass<'a> {
+        self.begin_inner(pass, None)
+    }
+
+    /// [`Frame::begin`], bracketed by GPU timestamps under `label`. Untimed
+    /// if the scope pool is full.
+    pub fn begin_timed<'a>(
+        &'a mut self,
+        pass: Pass,
+        label: &'static str,
+        timestamps: &mut GpuTimestamps,
+    ) -> RenderPass<'a> {
+        let scope = timestamps.claim(label);
+        self.begin_inner(pass, scope.map(|s| (s, timestamps.raw())))
+    }
+
+    fn begin_inner<'a>(
+        &'a mut self,
+        pass: Pass,
+        scope: Option<((u32, u32), &wgpu::QuerySet)>,
+    ) -> RenderPass<'a> {
         self.rotate_encoder();
         let color_attachments: Vec<_> = pass
             .colors
@@ -81,11 +107,17 @@ impl Frame {
             stencil_ops: None
         });
 
+        let timestamp_writes = scope.map(|((begin, end), query_set)| wgpu::RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(begin),
+            end_of_pass_write_index: Some(end),
+        });
+
         RenderPass::new(self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &color_attachments,
             depth_stencil_attachment,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None
         }))
@@ -99,11 +131,59 @@ impl Frame {
     /// remains the right call for compute that doesn't need a frame — it
     /// records into its own encoder and submits immediately.
     pub fn begin_compute<'a>(&'a mut self, label: Option<&str>) -> ComputePass<'a> {
+        self.begin_compute_inner(label, None)
+    }
+
+    /// [`Frame::begin_compute`], bracketed by GPU timestamps under `label`.
+    /// Untimed if the scope pool is full.
+    pub fn begin_compute_timed<'a>(
+        &'a mut self,
+        label: &'static str,
+        timestamps: &mut GpuTimestamps,
+    ) -> ComputePass<'a> {
+        let scope = timestamps.claim(label);
+        self.begin_compute_inner(Some(label), scope.map(|s| (s, timestamps.raw())))
+    }
+
+    fn begin_compute_inner<'a>(
+        &'a mut self,
+        label: Option<&str>,
+        scope: Option<((u32, u32), &wgpu::QuerySet)>,
+    ) -> ComputePass<'a> {
         self.rotate_encoder();
+        let timestamp_writes = scope.map(|((begin, end), query_set)| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(begin),
+            end_of_pass_write_index: Some(end),
+        });
         ComputePass::new(
             self.encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor { label, timestamp_writes: None }),
+                .begin_compute_pass(&wgpu::ComputePassDescriptor { label, timestamp_writes }),
         )
+    }
+
+    /// Records a buffer-to-buffer copy into this frame's encoder, sequenced
+    /// after whatever has already been recorded — so a copy issued after
+    /// [`resolve_timestamps`](Self::resolve_timestamps) reads the resolved
+    /// values, not the previous frame's.
+    pub fn copy_buffer(&mut self, src: &Buffer, dst: &Buffer) {
+        self.encoder
+            .copy_buffer_to_buffer(src.raw(), 0, dst.raw(), 0, src.size());
+    }
+
+    /// Resolves every scope claimed this frame into `dst`, which needs
+    /// `BufferUsages::QUERY_RESOLVE` (plus `COPY_SRC` to be readable). Call
+    /// once, after the last timed pass — the resolve gets its own command
+    /// buffer, sequenced after the passes it reads.
+    pub fn resolve_timestamps(&mut self, timestamps: &mut GpuTimestamps, dst: &Buffer) {
+        let queries = timestamps.used() * 2;
+        if queries == 0 {
+            return;
+        }
+        timestamps.snapshot_resolved();
+        self.rotate_encoder();
+        self.encoder
+            .resolve_query_set(timestamps.raw(), 0..queries, dst.raw(), 0);
     }
 }
 

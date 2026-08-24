@@ -20,6 +20,7 @@ pub mod frame;
 pub(crate) mod gpu_context;
 pub mod render_pass;
 pub mod targets;
+pub mod timestamps;
 
 /// The GPU device/queue/surface — inserted as a resource once acquisition
 /// finishes (see [`Read<Backend>`](crate::ecs::resources::Read), safe to
