@@ -85,9 +85,60 @@ impl GpuTimestamps {
         self.resolved.clone_from(&self.labels);
     }
 
+    /// Resolved bytes to `(label, begin_us, end_us)`, in recording order, with
+    /// both ends relative to the earliest timestamp in the frame.
+    ///
+    /// [`decode`](Self::decode) reports `end - begin` per scope, which only
+    /// means "what this pass cost" if scopes don't overlap. Render passes
+    /// routinely do: a tile-based GPU processes a frame's render passes as one
+    /// batch, so every pass's pair brackets the whole batch, each reports the
+    /// batch's duration, and summing them multiplies it. Measured on an
+    /// M-series Mac, three render passes reported begins within 0.6M ticks of
+    /// each other and ends within 0.03M — they are one interval, not three.
+    ///
+    /// Intervals let the caller merge overlapping scopes and take the union.
+    /// A scope whose end never advanced — some backends leave the last pass's
+    /// query unwritten — comes back with `end == begin` rather than being
+    /// dropped, so it can be reported as unmeasured instead of vanishing.
+    pub fn decode_intervals(&self, bytes: &[u8]) -> Vec<(&'static str, f64, f64)> {
+        let ticks: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        let base = self
+            .resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(scope, _)| ticks.get(scope * 2).copied())
+            .filter(|&t| t > 0)
+            .min()
+            .unwrap_or(0);
+        let to_us = |t: u64| (t.saturating_sub(base)) as f64 * self.period_ns as f64 / 1000.0;
+
+        self.resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(scope, label)| {
+                let begin = *ticks.get(scope * 2)?;
+                let end = *ticks.get(scope * 2 + 1)?;
+                if begin == 0 {
+                    return None;
+                }
+                // An unwritten end reads as 0; report it as a zero-length
+                // interval rather than letting it underflow into nonsense.
+                let end = if end < begin { begin } else { end };
+                Some((*label, to_us(begin), to_us(end)))
+            })
+            .collect()
+    }
+
     /// Resolved bytes to `(label, microseconds)`, in recording order. Pairs
     /// that didn't advance are dropped: a backend may return zeroes for
     /// queries it couldn't satisfy.
+    ///
+    /// Prefer [`decode_intervals`](Self::decode_intervals) for anything that
+    /// sums or compares scopes — see the overlap note there.
     pub fn decode(&self, bytes: &[u8]) -> Vec<(&'static str, f64)> {
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
