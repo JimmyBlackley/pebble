@@ -1,5 +1,5 @@
 use crate::graphics::{
-    pipeline::buffers::Buffer,
+    pipeline::{buffers::Buffer, textures::GPUTexture},
     render::{
         compute_pass::ComputePass, render_pass::RenderPass, targets::Pass,
         timestamps::GpuTimestamps,
@@ -169,6 +169,53 @@ impl Frame {
     pub fn copy_buffer(&mut self, src: &Buffer, dst: &Buffer) {
         self.encoder
             .copy_buffer_to_buffer(src.raw(), 0, dst.raw(), 0, src.size());
+    }
+
+    /// Records a copy of `src`'s mip 0 into `dst`, for CPU readback, sequenced
+    /// after whatever has already been recorded — so a copy issued after the
+    /// passes that draw into `src` sees this frame's image, not the last one's.
+    ///
+    /// Returns the **row stride in bytes**. WebGPU requires each row of a
+    /// texture-to-buffer copy to begin on a 256-byte boundary, so the stride is
+    /// the texture's row size rounded up: `dst` must hold `stride * height`
+    /// bytes, and the padding has to be dropped again on the way out. It is
+    /// returned rather than hidden because the caller has to de-pad regardless,
+    /// and a silently padded buffer is a subtle way to get a skewed image.
+    ///
+    /// `src` needs `TextureUsages::COPY_SRC` (see
+    /// [`Texture::with_extra_usage`](crate::graphics::pipeline::textures::Texture::with_extra_usage));
+    /// `dst` needs `COPY_DST`, plus `MAP_READ` to be read back.
+    pub fn copy_texture_to_buffer(&mut self, src: &GPUTexture, dst: &Buffer) -> u32 {
+        let texture = src.raw();
+        let bytes_per_pixel = texture
+            .format()
+            .block_copy_size(None)
+            .expect("a texture copied to a buffer must have a fixed block size");
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let stride = (src.width() * bytes_per_pixel).div_ceil(align) * align;
+
+        self.encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: dst.raw(),
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(src.height()),
+                },
+            },
+            wgpu::Extent3d {
+                width: src.width(),
+                height: src.height(),
+                depth_or_array_layers: 1,
+            },
+        );
+        stride
     }
 
     /// Resolves every scope claimed this frame into `dst`, which needs
