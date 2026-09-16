@@ -288,6 +288,18 @@ impl App {
         self.resources.get::<AppExit>().0
     }
 
+    /// Whether the GPU backend has finished coming up.
+    ///
+    /// Until it has, [`App::update`] runs only the internal GPU schedules and
+    /// returns, so no system of yours has run yet. A runner that draws on
+    /// demand has to keep asking for frames while this is `false`: nothing else
+    /// is in a position to ask, and the device is acquired asynchronously, so
+    /// the loop would otherwise go to sleep waiting for something whose arrival
+    /// it has arranged never to notice.
+    pub fn backend_ready(&self) -> bool {
+        self.resources.get::<BackendReady>().0
+    }
+
     /// Consumes the app and runs it. [`SystemStage::Startup`] runs first,
     /// exactly once, before anything else. Then, if a runner was installed
     /// (e.g. by a windowing plugin via [`App::set_runner`]), control is

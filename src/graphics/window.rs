@@ -36,20 +36,54 @@ pub enum RedrawPolicy {
 /// needs a continuous stream (an animation, a poll) must request on every tick
 /// rather than latching it once.
 #[derive(Clone)]
-pub struct Redraw(Arc<std::sync::atomic::AtomicBool>);
+pub struct Redraw {
+    wanted: Arc<std::sync::atomic::AtomicBool>,
+    /// The window to poke, once one exists. Setting the flag alone is only
+    /// enough from inside a frame, where the end-of-frame check is still to
+    /// come; a request arriving while the loop is *asleep* has to actually wake
+    /// it, or nothing will ever read the flag again.
+    window: Arc<Mutex<Option<Arc<OsWindow>>>>,
+}
+
+impl Default for Redraw {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Redraw {
-    fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    /// A handle to pass to [`WindowConfig::redraw`], so the caller keeps a
+    /// clone of the one the runner will use. Needed to wake the loop from
+    /// outside the ECS — a DOM callback, a timer, a host asking the app to
+    /// shut down — which is otherwise impossible, because the runner's own
+    /// handle is not created until it starts.
+    pub fn new() -> Self {
+        Self {
+            wanted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            window: Arc::new(Mutex::new(None)),
+        }
     }
 
-    /// Ask for one more frame.
+    /// Ask for one more frame, waking the loop if it is asleep.
     pub fn request(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.wanted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(window) = self.window.lock()
+            && let Some(window) = window.as_ref()
+        {
+            window.request_redraw();
+        }
+    }
+
+    fn attach(&self, window: Arc<OsWindow>) {
+        if let Ok(mut slot) = self.window.lock() {
+            *slot = Some(window);
+        }
     }
 
     fn take(&self) -> bool {
-        self.0.swap(false, std::sync::atomic::Ordering::Relaxed)
+        self.wanted
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -60,6 +94,9 @@ pub struct WindowConfig {
     pub height: u32,
     /// Whether the window free-runs or draws on demand. See [`RedrawPolicy`].
     pub redraw_policy: RedrawPolicy,
+    /// The [`Redraw`] handle the runner should use, when the caller needs a
+    /// clone of it before the app starts. `None` lets the runner make its own.
+    pub redraw: Option<Redraw>,
     /// Web only: the canvas to render into, via [`WindowConfig::with_canvas`].
     ///
     /// `None` keeps the historical behaviour — winit creates its own canvas and
@@ -84,6 +121,7 @@ impl Default for WindowConfig {
             width: 1280,
             height: 720,
             redraw_policy: RedrawPolicy::default(),
+            redraw: None,
             #[cfg(target_arch = "wasm32")]
             canvas: None,
             prevent_default: true,
@@ -373,6 +411,14 @@ impl ApplicationHandler for WinitApp {
             return;
         };
 
+        // Adopt the caller's handle before the window exists, so that the
+        // `attach` below reaches the clone they are holding and not one we are
+        // about to throw away.
+        self.redraw_policy = config.redraw_policy;
+        if let Some(redraw) = config.redraw.clone() {
+            self.redraw = redraw;
+        }
+
         #[allow(unused_mut)]
         let mut attrs = OsWindow::default_attributes().with_title(config.title);
 
@@ -408,9 +454,11 @@ impl ApplicationHandler for WinitApp {
 
         let os_window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.window = Some(os_window.clone());
+        // From here a `Redraw::request` can wake the loop rather than only
+        // setting a flag for a frame that may never come.
+        self.redraw.attach(os_window.clone());
         let window = Window::new(os_window);
 
-        self.redraw_policy = config.redraw_policy;
 
         self.app = std::mem::take(&mut self.app)
             .insert_resource(window)
@@ -437,6 +485,13 @@ impl ApplicationHandler for WinitApp {
                 }
                 self.input.end_step();
 
+                // Sampled before the tick, not after: the frame that brings the
+                // backend up runs only the internal GPU schedules, so no system
+                // of ours has had a chance to ask for the next one. Testing
+                // readiness afterwards would see `true` on exactly that frame
+                // and let the loop sleep one tick before anything had run.
+                let was_ready = self.app.backend_ready();
+
                 self.app.update();
                 if self.app.should_exit() {
                     event_loop.exit();
@@ -450,7 +505,8 @@ impl ApplicationHandler for WinitApp {
                 // nothing asking for a frame, no redraw is queued, `Wait` puts
                 // the loop to sleep, and the last presented image stays on
                 // screen at no cost. Input and `Redraw::request` wake it again.
-                if self.redraw_policy == RedrawPolicy::Continuous || self.redraw.take() {
+                let wanted = self.redraw.take();
+                if self.redraw_policy == RedrawPolicy::Continuous || !was_ready || wanted {
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
