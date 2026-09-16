@@ -13,11 +13,53 @@ use crate::{
     graphics::types::{CursorGrabMode, CursorIcon, KeyCode, MouseButton},
 };
 
+/// How the runner decides whether to draw another frame.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum RedrawPolicy {
+    /// Redraw every frame, forever. What a game wants, and the historical
+    /// behaviour — so it stays the default.
+    #[default]
+    Continuous,
+    /// Redraw only when input arrives or something asks via [`Redraw`].
+    ///
+    /// For an app whose image is usually static — a viewer, an editor — where
+    /// re-presenting an identical frame at the display's rate is pure cost.
+    /// Anything that animates, polls, or is waiting on an async load has to
+    /// ask for each frame it needs, or the app will simply stop.
+    OnDemand,
+}
+
+/// Asks the runner for another frame under [`RedrawPolicy::OnDemand`].
+/// Inserted as a resource by [`WindowPlugin`]; a no-op under `Continuous`.
+///
+/// The flag is consumed once the frame it asked for begins, so a system that
+/// needs a continuous stream (an animation, a poll) must request on every tick
+/// rather than latching it once.
+#[derive(Clone)]
+pub struct Redraw(Arc<std::sync::atomic::AtomicBool>);
+
+impl Redraw {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    /// Ask for one more frame.
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Initial window title/size, passed to [`WindowPlugin::new`].
 pub struct WindowConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Whether the window free-runs or draws on demand. See [`RedrawPolicy`].
+    pub redraw_policy: RedrawPolicy,
 }
 
 impl Default for WindowConfig {
@@ -26,6 +68,7 @@ impl Default for WindowConfig {
             title: "Pebble".to_string(),
             width: 1280,
             height: 720,
+            redraw_policy: RedrawPolicy::default(),
         }
     }
 }
@@ -264,6 +307,20 @@ struct WinitApp {
     window: Option<Arc<OsWindow>>,
     pending_window_events: Vec<WindowEvent>,
     pending_device_events: Vec<DeviceEvent>,
+    redraw: Redraw,
+    redraw_policy: RedrawPolicy,
+}
+
+impl WinitApp {
+    /// Wake the loop for an event that arrived while it was idle. Free under
+    /// `Continuous`, where a redraw is always already pending.
+    fn wake(&self) {
+        if self.redraw_policy == RedrawPolicy::OnDemand
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+    }
 }
 
 impl ApplicationHandler for WinitApp {
@@ -290,9 +347,12 @@ impl ApplicationHandler for WinitApp {
         self.window = Some(os_window.clone());
         let window = Window::new(os_window);
 
+        self.redraw_policy = config.redraw_policy;
+
         self.app = std::mem::take(&mut self.app)
             .insert_resource(window)
-            .insert_resource(self.input.clone());
+            .insert_resource(self.input.clone())
+            .insert_resource(self.redraw.clone());
 
         // Kick off the first frame — under `ControlFlow::Wait` nothing else
         // will ever request one.
@@ -322,14 +382,27 @@ impl ApplicationHandler for WinitApp {
 
                 // `resumed` always runs before the first `window_event`, so
                 // the window is guaranteed to exist here.
-                self.window.as_ref().unwrap().request_redraw();
+                //
+                // Under `OnDemand` this is where the loop actually stops: with
+                // nothing asking for a frame, no redraw is queued, `Wait` puts
+                // the loop to sleep, and the last presented image stays on
+                // screen at no cost. Input and `Redraw::request` wake it again.
+                if self.redraw_policy == RedrawPolicy::Continuous || self.redraw.take() {
+                    self.window.as_ref().unwrap().request_redraw();
+                }
             }
-            other => self.pending_window_events.push(other),
+            other => {
+                self.pending_window_events.push(other);
+                // Buffered events are only drained by a redraw, so on demand
+                // one has to be asked for or the input would sit there unseen.
+                self.wake();
+            }
         }
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
         self.pending_device_events.push(event);
+        self.wake();
     }
 }
 
@@ -349,6 +422,8 @@ impl Plugin for WindowPlugin {
                 window: None,
                 pending_window_events: Vec::new(),
                 pending_device_events: Vec::new(),
+                redraw: Redraw::new(),
+                redraw_policy: RedrawPolicy::default(),
             };
 
             // `run_app` blocks forever natively; on wasm it only works via an
