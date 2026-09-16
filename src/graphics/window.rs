@@ -60,6 +60,21 @@ pub struct WindowConfig {
     pub height: u32,
     /// Whether the window free-runs or draws on demand. See [`RedrawPolicy`].
     pub redraw_policy: RedrawPolicy,
+    /// Web only: the canvas to render into, via [`WindowConfig::with_canvas`].
+    ///
+    /// `None` keeps the historical behaviour — winit creates its own canvas and
+    /// appends it to `<body>`, which is fine for a page that is nothing but the
+    /// app, and useless for one embedding it, since the canvas then escapes the
+    /// host's layout entirely.
+    #[cfg(target_arch = "wasm32")]
+    pub canvas: Option<web_sys::HtmlCanvasElement>,
+    /// Web only: whether winit calls `preventDefault()` on canvas events with
+    /// side effects. winit's own default is `true`; an embedded app often wants
+    /// `false` so the host page keeps its scrolling and focus behaviour.
+    pub prevent_default: bool,
+    /// Web only: whether the canvas is tab-focusable. Keyboard events on the
+    /// web are canvas-scoped, so this has to stay on for them to arrive at all.
+    pub focusable: bool,
 }
 
 impl Default for WindowConfig {
@@ -69,7 +84,24 @@ impl Default for WindowConfig {
             width: 1280,
             height: 720,
             redraw_policy: RedrawPolicy::default(),
+            #[cfg(target_arch = "wasm32")]
+            canvas: None,
+            prevent_default: true,
+            focusable: true,
         }
+    }
+}
+
+impl WindowConfig {
+    /// Render into a canvas the host already owns, instead of one winit creates
+    /// and appends to `<body>`. Web only.
+    ///
+    /// This is what makes the app embeddable: the canvas stays where the host
+    /// put it, obeys the host's CSS, and is removed with the host's own element.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_canvas(mut self, canvas: web_sys::HtmlCanvasElement) -> Self {
+        self.canvas = Some(canvas);
+        self
     }
 }
 
@@ -85,6 +117,18 @@ impl Window {
 
     pub(crate) fn raw(&self) -> Arc<OsWindow> {
         self.0.clone()
+    }
+
+    /// The canvas this window renders into. Web only.
+    ///
+    /// Exposed so an app can attach its own DOM listeners — a `ResizeObserver`,
+    /// or pointer events winit does not surface, such as stylus pressure and
+    /// tilt — to the element winit is actually using, rather than guessing at
+    /// it with a `querySelector`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn canvas(&self) -> Option<web_sys::HtmlCanvasElement> {
+        use winit::platform::web::WindowExtWebSys;
+        self.0.canvas()
     }
 
     pub fn set_title(&self, title: &str) {
@@ -330,17 +374,36 @@ impl ApplicationHandler for WinitApp {
         };
 
         #[allow(unused_mut)]
-        let mut attrs = OsWindow::default_attributes()
-            .with_title(config.title)
-            .with_inner_size(winit::dpi::PhysicalSize::new(config.width, config.height));
+        let mut attrs = OsWindow::default_attributes().with_title(config.title);
 
-        // winit doesn't insert the canvas into the page on its own — ask it
-        // to, so a window actually shows up without hand-rolled web_sys/DOM
-        // code
+        // A host canvas is already laid out by the page's CSS, so the requested
+        // size is not ours to impose: winit writes an inner size onto the canvas
+        // as inline pixel styles, and inline styles beat the host's stylesheet.
+        // Measured before this guard — a 640x380 container held a canvas that
+        // stayed stubbornly 1280x720 and overflowed it. Everywhere else the
+        // requested size is the only size there is, so it still applies.
+        #[cfg(target_arch = "wasm32")]
+        let size_is_ours = config.canvas.is_none();
+        #[cfg(not(target_arch = "wasm32"))]
+        let size_is_ours = true;
+
+        if size_is_ours {
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(config.width, config.height));
+        }
+
         #[cfg(target_arch = "wasm32")]
         {
             use winit::platform::web::WindowAttributesExtWebSys;
-            attrs = attrs.with_append(true);
+            // With a host canvas, take it and append nothing: the element is
+            // already in the page, where the host's layout wants it. Without
+            // one, winit creates its own and we ask it to insert that, so a
+            // window still shows up without hand-rolled web_sys/DOM code.
+            let host_canvas = config.canvas.clone();
+            attrs = attrs
+                .with_append(host_canvas.is_none())
+                .with_canvas(host_canvas)
+                .with_prevent_default(config.prevent_default)
+                .with_focusable(config.focusable);
         }
 
         let os_window = Arc::new(event_loop.create_window(attrs).unwrap());
@@ -408,13 +471,20 @@ impl ApplicationHandler for WinitApp {
 
 impl Plugin for WindowPlugin {
     fn build(self, app: crate::app::App) -> crate::app::App {
-        let event_loop = EventLoop::new().unwrap();
-        // The loop is paced by `request_redraw` (see `WinitApp`), not by
-        // spinning — `Wait` lets it actually sleep between frames instead of
-        // busy-polling.
-        event_loop.set_control_flow(ControlFlow::Wait);
-
         app.set_runner(move |app| {
+            // Constructed here, not in `build`. winit allows one event loop per
+            // process and returns `RecreationAttempt` for a second, so building
+            // it while merely *assembling* an App made construction itself the
+            // scarce operation: a host that builds an App it then decides not to
+            // run — React StrictMode double-invoking an effect in development is
+            // the everyday case — would panic on the next attempt. Creating it
+            // at run time means only actually running twice is an error.
+            let event_loop = EventLoop::new().unwrap();
+            // The loop is paced by `request_redraw` (see `WinitApp`), not by
+            // spinning — `Wait` lets it actually sleep between frames instead of
+            // busy-polling.
+            event_loop.set_control_flow(ControlFlow::Wait);
+
             let handler = WinitApp {
                 config: Some(self.config),
                 app,
