@@ -110,10 +110,22 @@ pub struct GPUReceiver {
     promise: Promise<Backend>,
 }
 
-async fn init_gpu(window: Arc<winit::window::Window>, config: BackendConfig) -> Backend {
+/// Acquire the GPU, or say why it could not be.
+///
+/// Fallible rather than panicking because the most likely reason to fail is a
+/// browser without WebGPU, and a wasm trap there is the worst of both worlds:
+/// the host application gets an unhandleable abort instead of an error it could
+/// have shown a human. `poll_gpu` already treats a dropped sender as "no usable
+/// backend, stay idle", so an error here degrades along a path that exists.
+async fn init_gpu(
+    window: Arc<winit::window::Window>,
+    config: BackendConfig,
+) -> Result<Backend, String> {
     let instance = wgpu::Instance::default();
 
-    let surface = instance.create_surface(window.clone()).unwrap();
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|e| format!("could not create a drawing surface: {e}"))?;
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -123,7 +135,12 @@ async fn init_gpu(window: Arc<winit::window::Window>, config: BackendConfig) -> 
             apply_limit_buckets: true,
         })
         .await
-        .unwrap();
+        .map_err(|e| {
+            format!(
+                "no usable GPU adapter: {e}. On the web this usually means the \
+                 browser has no WebGPU support"
+            )
+        })?;
 
     // Best-effort: an optional feature the adapter doesn't support is
     // dropped rather than failing device creation. `Backend::features`
@@ -136,7 +153,7 @@ async fn init_gpu(window: Arc<winit::window::Window>, config: BackendConfig) -> 
             ..Default::default()
         })
         .await
-        .unwrap();
+        .map_err(|e| format!("the GPU adapter would not grant a device: {e}"))?;
 
     // On the web the window may not have a size yet (see `web_canvas_size`)
     // — a zero configure is invalid, so clamp; `begin_frame` reconfigures to
@@ -144,11 +161,24 @@ async fn init_gpu(window: Arc<winit::window::Window>, config: BackendConfig) -> 
     let window_size = window.inner_size();
 
     let caps = surface.get_capabilities(&adapter);
+    // A surface with no non-sRGB format is not one this renderer can drive, and
+    // that is worth saying rather than indexing off the end of the list.
+    let format = caps
+        .formats
+        .iter()
+        .find(|f| !f.is_srgb())
+        .ok_or_else(|| {
+            format!(
+                "the surface offers no non-sRGB format (got {:?})",
+                caps.formats
+            )
+        })?
+        .clone();
     let surface_configuration = wgpu::SurfaceConfiguration {
         alpha_mode: caps.alpha_modes[0],
         present_mode: caps.present_modes[0],
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: caps.formats.iter().find(|f| !f.is_srgb()).unwrap().clone(),
+        format,
         width: window_size.width.max(1),
         height: window_size.height.max(1),
         color_space: wgpu::SurfaceColorSpace::Auto,
@@ -157,15 +187,13 @@ async fn init_gpu(window: Arc<winit::window::Window>, config: BackendConfig) -> 
     };
     surface.configure(&device, &surface_configuration);
 
-    let backend = Backend {
+    Ok(Backend {
         device,
         queue,
         surface,
         surface_configuration,
         features: required_features.into(),
-    };
-
-    backend
+    })
 }
 
 pub(crate) fn obtain_gpu(
@@ -184,8 +212,13 @@ pub(crate) fn obtain_gpu(
     let features = config.features;
 
     let fut = async move {
-        let result = init_gpu(window, BackendConfig { features }).await;
-        fulfiller.fulfill(result);
+        match init_gpu(window, BackendConfig { features }).await {
+            Ok(backend) => fulfiller.fulfill(backend),
+            // Dropping the fulfiller disconnects the promise, which `poll_gpu`
+            // already reports as "no usable backend". Log the reason here,
+            // where it is still known.
+            Err(reason) => tracing::error!("GPU backend unavailable: {reason}"),
+        }
     };
 
     // the window is bound to the main thread (winit panics if touched off
