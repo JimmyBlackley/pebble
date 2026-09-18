@@ -83,6 +83,16 @@ Three things about `OnDemand` are easy to get wrong, and all three were:
 clicking it did nothing and reported nothing. Polled state has to become pushed
 calls — which is what `AppHandle` is for.
 
+**GPU readback is an instance of this rule, and an easy one to miss.**
+`Buffer::read`/`Buffer::map_read` hand back a `Promise`, and a `Promise` is
+polled — by a system, once per tick, on a tick that only happens if something
+asked for it. A readback issued on the last frame before the loop sleeps
+resolves into a queue nothing comes back to drain, and the symptom is not an
+error but a value that never arrives. Anything with a readback outstanding has
+to hold a `Redraw` and request a frame until it resolves. `maintain_gpu` drives
+`Device::poll` once per tick and is subject to exactly the same condition: no
+tick, no map callbacks, no resolution.
+
 ### 3. Be told things from outside the ECS
 
 `AppHandle` (from `feat/stream-and-app-handle`) is the supported channel: get one
@@ -159,45 +169,116 @@ Not bugs; things to design around.
 ## Verifying it still works
 
 The behaviours above are not unit-testable — they are about what a browser does
-with a real module. The consumer's `web/embed-test.html` is the harness, driven
-headlessly by Playwright, and it checks:
+with a real module. The consumer's `web/embed-test.html` is the harness, and
+`tools/embed_probe.mjs` in that repo drives it headlessly:
+
+```
+cd Medsplat-Viewer && python3 compile.py && node tools/embed_probe.mjs
+```
+
+It checks:
 
 - the module instantiates and renders **nothing** until asked;
 - **zero** stray canvases appended to `<body>`;
 - the canvas obeys its container, including across a CSS resize (640×380 → 860×460,
   backing store included);
+- the canvas actually draws — a flat field fails, so "mounted correctly and
+  rendered nothing" cannot pass;
 - a second mount is refused cleanly rather than trapping;
 - destroy → remount works, and the remounted viewer loads and renders.
+
+Every check runs at `devicePixelRatio` 1 and 2; the backing-store assertions
+only bite on the second.
+
+Two things about the runner are load-bearing. It uses **Google Chrome**, not
+Playwright's bundled Chromium — that one has no `navigator.gpu` headless, and
+when coaxed into one it resolves a SwiftShader adapter, so it would pass a test
+the real Metal pipeline fails. And it reads the canvas through a **compositor
+screenshot**, not an in-page `drawImage`: a WebGPU canvas carries no `COPY_SRC`
+and its presented texture is gone, so `drawImage` returns a blank field for a
+canvas that is demonstrably drawing.
 
 Anything that changes windowing, the run loop or GPU acquisition should be run
 against it. A regression here looks like success from inside Rust.
 
 ---
 
-## The actual blocker: two lineages
+## The lineages: there is only one
 
-`fork/main` and `feat/embed` have diverged by **102 and 242 commits** from a
-common base (`0b6f4fc`). A trial merge produces **30 conflicts, 20 of them in
-`src/`**.
+An earlier version of this document called `fork/main` and `feat/embed` two
+divergent lineages needing reconciliation, on the evidence that they are 102
+and 243 commits from a common base (`0b6f4fc`) and that a trial merge produces
+**30 conflicts**. That reading was wrong, and the measurement that settles it
+is one command:
 
-This is not a textual merge. The two lineages reorganised the tree differently —
-what is `src/rendering/*` on `fork/main` is `src/graphics/*` on `feat/embed`, so
-those appear as modify/delete pairs — and `fork/main` carries `feat!:` breaking
-changes to the material and bind-group API, plus its own work that *overlaps what
-`feat/embed` solves differently*:
+```
+$ git cherry feat/embed fork/main | grep -c '^+'
+0
+```
 
-- `fix: pace web frame loop to requestAnimationFrame instead of unthrottled Poll`
-- `fix: sync canvas/window size to browser viewport on resize`
-- `feat: add GPU->CPU readback helpers and clean up stale code`
-- `feat!: explicit bind group and binding indices in materials/compute`
+**Not one of `fork/main`'s 102 commits is absent from `feat/embed`.** It is not
+equivalent work arrived at separately — they are the same patches. The four
+commits previously listed here as overlapping solutions each have a
+patch-identical twin already in `feat/embed`'s history under a different SHA:
 
-Each of those has a counterpart on `feat/embed`. Reconciliation means choosing a
-winner per subsystem and knowing why, not resolving conflict markers.
+| `fork/main` | `feat/embed` |
+|---|---|
+| `4121053` pace web frame loop to rAF | `4c401b9` |
+| `bb8dc25` sync canvas/window size on resize | `f213305` |
+| `d4c2d46` GPU→CPU readback helpers | `77cf114` |
+| `8e4f7ee` **feat!** explicit bind group/binding indices | `8783427` |
 
-**Nothing is blocked by this today.** The consumer pins rev `f4a836a` on
-`feat/embed`, which builds from GitHub and is what its production deployment
-runs. This is consolidation, and it should be done deliberately or not at all.
+`feat/embed` is `fork/main`'s history, rebased, and then continued. `fork/main`'s
+last commit is 2026-08-03; `feat/embed`'s next is 2026-08-04. And upstream
+settles it from the other side:
 
-Whoever takes it on should know that the consumer is written against
-`feat/embed`'s API and moves with whatever is chosen — so the two repositories
-have to be stepped forward together, with the harness above as the gate.
+```
+$ git merge-base --is-ancestor origin/main feat/embed   # yes
+$ git merge-base --is-ancestor origin/main fork/main    # no — 121 commits behind
+```
+
+`feat/embed` contains upstream `Akihiro120/pebble` main as a direct ancestor,
+including the winit-0.30 migration. `fork/main` never took it, which is why it
+is still on winit 0.29 / wgpu 29 — and therefore why it cannot implement any of
+this document: `with_canvas` is a winit 0.30 API.
+
+**The 30 conflicts are a rebase artifact.** They land on `src/app.rs`,
+`src/assets/*`, `src/ecs/*` and `src/lib.rs` — the files a later ECS rework
+touched — plus modify/delete pairs for `src/rendering/*` → `src/graphics/*`.
+Merging would re-apply 102 already-applied commits on top of their own
+successors. Every conflict resolves to "take `feat/embed`".
+
+So there is no winner to choose per subsystem. The question is only whether the
+stale pointer is worth moving, and it is: `fork/main` cannot build the consumer
+at all — `Promise`, `BackendReady`, `AppExit`, `AppHandle`, `Stream`,
+`GpuTimestamps`, `RedrawPolicy`, `GlobalLayoutPool`, `with_extra_group`,
+`OwnEntriesBuilder`, `copy_texture_to_buffer` and `without_clear` occur zero
+times on it.
+
+### What the rework did cost
+
+Promoting `feat/embed` is not free. The post-2026-08-04 ECS rework dropped
+things `fork/main` still had, and they are gone unless re-added:
+
+| Dropped | Status |
+|---|---|
+| `LazyResource` / `LazyResourcePlugin` | still missing |
+| `BackgroundTasks` thread pool | native-only; useless on the wasm target |
+| `Backend`/`WindowProvider`/`WindowRunner` traits | correctly dropped — one impl |
+| the 8 `examples/` | still missing |
+| run conditions (`run_if`) | **restored** |
+| `src/prelude.rs` | **restored** |
+
+The scheduler itself is not a gap: `.after`/`.before`/priority/chains/cycle
+detection are covered by unit tests in `src/ecs/mod.rs`, which is better
+targeted than the single integration test that was dropped with them.
+
+**The rev pin stays either way.** "Which lineage is the future" and "should the
+consumer pin a rev" are independent questions, and this document used to run
+them together. Pinning a rev is correct practice — without it, production
+changes with no commit in the consumer — and it should outlive the pointer move.
+
+Because the chosen lineage *is* the one the consumer is already written
+against, promoting it is an API no-op for the consumer. The two repositories do
+not have to move in lockstep; only additive work like the table above can
+change the API, and that goes through the gate above like anything else.
