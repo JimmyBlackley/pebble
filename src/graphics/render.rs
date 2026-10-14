@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    app::BackendReady,
+    app::{AppExit, BackendReady},
     ecs::{
         commands::Commands,
         plugin::Plugin,
@@ -74,8 +74,54 @@ impl Backend {
     }
 }
 
+/// Why the GPU could not be acquired. Handed to
+/// [`GraphicsPlugin::on_backend_error`](crate::graphics::GraphicsPlugin::on_backend_error),
+/// so a host can tell a human which of these it was.
+#[derive(Debug, Clone)]
+pub enum BackendError {
+    /// The window would not give wgpu a surface. On the web,
+    /// `canvas.getContext("webgpu")` returned null — the canvas already holds
+    /// another kind of context.
+    Surface(String),
+    /// No adapter. On the web this is either no `navigator.gpu` at all, or —
+    /// the case a host cannot check for in advance — `requestAdapter()`
+    /// resolving to null: the browser has WebGPU but will not use this
+    /// machine's GPU for it (a blocklisted driver, hardware acceleration off,
+    /// a remote desktop or virtual machine).
+    NoAdapter(String),
+    /// The adapter would not create a device.
+    Device(String),
+    /// The surface offers no non-sRGB format, which this renderer needs.
+    SurfaceFormat(String),
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Surface(e) => write!(f, "could not create a drawing surface: {e}"),
+            Self::NoAdapter(e) => write!(f, "no usable GPU adapter: {e}"),
+            Self::Device(e) => write!(f, "the GPU adapter would not grant a device: {e}"),
+            Self::SurfaceFormat(formats) => {
+                write!(f, "the surface offers no non-sRGB format (got {formats})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackendError {}
+
+pub(crate) type BackendErrorReport = Box<dyn FnOnce(&BackendError) + Send + Sync>;
+
+/// The host's [`BackendError`] callback, taken the one time it is called.
+pub(crate) struct BackendErrorHook(Option<BackendErrorReport>);
+
+/// Present once acquisition has failed for good, so `obtain_gpu` does not
+/// start over.
+pub(crate) struct BackendFailed;
+
 pub(crate) struct BackendPlugin {
     features: DeviceFeatures,
+    on_error: Option<BackendErrorReport>,
 }
 
 pub(crate) struct BackendConfig {
@@ -84,7 +130,15 @@ pub(crate) struct BackendConfig {
 
 impl BackendPlugin {
     pub fn with_features(features: DeviceFeatures) -> Self {
-        Self { features }
+        Self {
+            features,
+            on_error: None,
+        }
+    }
+
+    pub fn on_error(mut self, report: Option<BackendErrorReport>) -> Self {
+        self.on_error = report;
+        self
     }
 }
 
@@ -93,6 +147,7 @@ impl Plugin for BackendPlugin {
         app.insert_resource(BackendConfig {
             features: self.features,
         })
+        .insert_resource(BackendErrorHook(self.on_error))
         .insert_resource(CurrentFrame::default())
         .add_gpu_system(crate::ecs::system::SystemStage::Update, obtain_gpu)
         .add_gpu_system(crate::ecs::system::SystemStage::Update, poll_gpu)
@@ -107,25 +162,24 @@ impl Plugin for BackendPlugin {
 }
 
 pub struct GPUReceiver {
-    promise: Promise<Backend>,
+    promise: Promise<Result<Backend, BackendError>>,
 }
 
 /// Acquire the GPU, or say why it could not be.
 ///
 /// Fallible rather than panicking because the most likely reason to fail is a
-/// browser without WebGPU, and a wasm trap there is the worst of both worlds:
-/// the host application gets an unhandleable abort instead of an error it could
-/// have shown a human. `poll_gpu` already treats a dropped sender as "no usable
-/// backend, stay idle", so an error here degrades along a path that exists.
+/// browser without a usable WebGPU, and a wasm trap there is the worst of both
+/// worlds: the host application gets an unhandleable abort instead of an error
+/// it could have shown a human. `poll_gpu` hands the error to the host.
 async fn init_gpu(
     window: Arc<winit::window::Window>,
     config: BackendConfig,
-) -> Result<Backend, String> {
+) -> Result<Backend, BackendError> {
     let instance = wgpu::Instance::default();
 
     let surface = instance
         .create_surface(window.clone())
-        .map_err(|e| format!("could not create a drawing surface: {e}"))?;
+        .map_err(|e| BackendError::Surface(e.to_string()))?;
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -135,12 +189,7 @@ async fn init_gpu(
             apply_limit_buckets: true,
         })
         .await
-        .map_err(|e| {
-            format!(
-                "no usable GPU adapter: {e}. On the web this usually means the \
-                 browser has no WebGPU support"
-            )
-        })?;
+        .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
 
     // Best-effort: an optional feature the adapter doesn't support is
     // dropped rather than failing device creation. `Backend::features`
@@ -153,7 +202,7 @@ async fn init_gpu(
             ..Default::default()
         })
         .await
-        .map_err(|e| format!("the GPU adapter would not grant a device: {e}"))?;
+        .map_err(|e| BackendError::Device(e.to_string()))?;
 
     // On the web the window may not have a size yet (see `web_canvas_size`)
     // — a zero configure is invalid, so clamp; `begin_frame` reconfigures to
@@ -167,12 +216,7 @@ async fn init_gpu(
         .formats
         .iter()
         .find(|f| !f.is_srgb())
-        .ok_or_else(|| {
-            format!(
-                "the surface offers no non-sRGB format (got {:?})",
-                caps.formats
-            )
-        })?
+        .ok_or_else(|| BackendError::SurfaceFormat(format!("{:?}", caps.formats)))?
         .clone();
     let surface_configuration = wgpu::SurfaceConfiguration {
         alpha_mode: caps.alpha_modes[0],
@@ -200,10 +244,12 @@ pub(crate) fn obtain_gpu(
     mut commands: Commands,
     window: Read<Window>,
     receiver: Option<Read<GPUReceiver>>,
+    failed: Option<Read<BackendFailed>>,
     config: Read<BackendConfig>,
 ) {
-    // already waiting on a previous request, nothing to do
-    if receiver.is_some() {
+    // already waiting on a previous request, or it failed and asking again
+    // would only fail again
+    if receiver.is_some() || failed.is_some() {
         return;
     }
 
@@ -212,13 +258,7 @@ pub(crate) fn obtain_gpu(
     let features = config.features;
 
     let fut = async move {
-        match init_gpu(window, BackendConfig { features }).await {
-            Ok(backend) => fulfiller.fulfill(backend),
-            // Dropping the fulfiller disconnects the promise, which `poll_gpu`
-            // already reports as "no usable backend". Log the reason here,
-            // where it is still known.
-            Err(reason) => tracing::error!("GPU backend unavailable: {reason}"),
-        }
+        fulfiller.fulfill(init_gpu(window, BackendConfig { features }).await);
     };
 
     // the window is bound to the main thread (winit panics if touched off
@@ -241,6 +281,7 @@ pub(crate) fn poll_gpu(
     mut commands: Commands,
     mut ready: Write<BackendReady>,
     receiver: Option<Read<GPUReceiver>>,
+    hook: Option<Write<BackendErrorHook>>,
 ) {
     let Some(receiver) = receiver else {
         return;
@@ -249,20 +290,37 @@ pub(crate) fn poll_gpu(
     if !ready.0 {
         // continue polling for the gpu
         match receiver.promise.poll() {
-            PromiseState::Ready(backend) => {
+            PromiseState::Ready(Ok(backend)) => {
                 tracing::info!("GPU backend ready, adding as resource");
                 commands.insert_resource(backend);
                 ready.0 = true;
             }
+            PromiseState::Ready(Err(error)) => {
+                tracing::error!("GPU backend unavailable: {error}");
+                if let Some(report) = hook.and_then(|mut hook| hook.0.take()) {
+                    report(&error);
+                }
+                give_up_on_gpu(&mut commands);
+            }
             PromiseState::Pending => {}
+            // `init_gpu` reports either way, so only a future dropped before it
+            // finished gets here.
             PromiseState::Disconnected => {
-                tracing::error!(
-                    "GPU backend init sender was dropped without ever sending a value — the \
-                         app has no usable backend and will stay idle forever"
-                );
+                tracing::error!("GPU backend init ended without reporting a result");
+                give_up_on_gpu(&mut commands);
             }
         }
     }
+}
+
+/// With no backend, no system of the app's own will ever run, so there is
+/// nothing left to wait for. Ending the app beats the alternative: a runner
+/// asking for frames forever to poll for a backend that is not coming, and a
+/// host left unable to shut down an app whose shutdown systems never run.
+fn give_up_on_gpu(commands: &mut Commands) {
+    commands.remove_resource::<GPUReceiver>();
+    commands.insert_resource(BackendFailed);
+    commands.insert_resource(AppExit(true));
 }
 
 pub(crate) fn clean_up_gpu_acquisition_resources(
@@ -348,4 +406,66 @@ pub(crate) fn end_frame(backend: Read<Backend>, mut current_frame: Write<Current
     let (buffers, surface_texture) = frame.finish();
     backend.queue.submit(buffers);
     backend.queue.present(surface_texture);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::{app::App, ecs::system::SystemStage};
+
+    #[derive(Default)]
+    struct Observed {
+        reports: Vec<String>,
+        waiting: bool,
+        failed: bool,
+    }
+
+    /// A failed acquisition reports once, stops polling and asking, and ends
+    /// the app — rather than logging on every tick of a loop that asks for
+    /// frames forever.
+    #[test]
+    fn a_failed_acquisition_reports_once_and_exits() {
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let (fulfiller, promise) = Promise::new();
+        fulfiller.fulfill(Err(BackendError::NoAdapter(
+            "requestAdapter() resolved to null".into(),
+        )));
+
+        let reports = observed.clone();
+        let watch = observed.clone();
+        let mut app = App::new()
+            .insert_resource(GPUReceiver { promise })
+            .insert_resource(BackendErrorHook(Some(Box::new(
+                move |error: &BackendError| {
+                    reports.lock().unwrap().reports.push(error.to_string());
+                },
+            ))))
+            .add_gpu_system(SystemStage::Update, poll_gpu)
+            .add_gpu_system(
+                SystemStage::PostUpdate,
+                move |receiver: Option<Read<GPUReceiver>>, failed: Option<Read<BackendFailed>>| {
+                    let mut seen = watch.lock().unwrap();
+                    seen.waiting = receiver.is_some();
+                    seen.failed = failed.is_some();
+                },
+            );
+
+        app.update();
+        app.update();
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(
+            seen.reports,
+            vec!["no usable GPU adapter: requestAdapter() resolved to null".to_string()]
+        );
+        assert!(
+            !seen.waiting,
+            "the receiver is dropped, so nothing polls it again"
+        );
+        assert!(seen.failed, "obtain_gpu is told not to start over");
+        assert!(app.should_exit());
+        assert!(!app.backend_ready());
+    }
 }

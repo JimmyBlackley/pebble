@@ -13,9 +13,9 @@ use crate::ecs::{
 };
 
 /// Set this to `true` (e.g. `commands.insert_resource(AppExit(true))`) to
-/// stop the default headless polling loop after the current tick. Has no
-/// effect on a windowing plugin's own runner — closing the window is what
-/// stops that one.
+/// stop the app after the current tick. Both the default headless loop and
+/// the windowing plugin's runner check it after every tick, whether or not the
+/// GPU backend ever came up — a failed acquisition sets it.
 #[derive(Default)]
 pub struct AppExit(pub bool);
 
@@ -323,17 +323,16 @@ impl App {
             let was_ready = self.resources.get::<BackendReady>().0;
             self.update();
 
+            if self.should_exit() {
+                break;
+            }
+
             if !was_ready {
                 // no real OS thread to sleep on wasm32 — just busy-poll.
                 // Only reached at all when an app never registers a
                 // windowing plugin, which always overrides this runner.
                 #[cfg(not(target_arch = "wasm32"))]
                 std::thread::sleep(std::time::Duration::from_millis(16));
-                continue;
-            }
-
-            if self.should_exit() {
-                break;
             }
         }
     }

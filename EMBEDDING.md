@@ -119,8 +119,12 @@ Two changes make this survivable:
 - **Acquiring the GPU is fallible, not a panic.** `request_adapter`/`request_device`
   were unwrapped, so a browser without WebGPU got a wasm trap rather than an
   error — unhandleable by the host, with nothing to show a user, and with the
-  whole module dead afterwards. `init_gpu` returns `Result` and drops the
-  fulfiller on failure, a path `poll_gpu` already treated as "no usable backend".
+  whole module dead afterwards. `init_gpu` returns `Result`, and on failure
+  `poll_gpu` hands the `BackendError` to `GraphicsPlugin::on_backend_error` and
+  ends the app. Ending it matters as much as reporting it. A failed app used to
+  stay "idle", which was neither: the runner kept asking for frames to poll for
+  a backend that was not coming, and a host's shutdown, being a system, never
+  ran, so `destroy()` could not stop it and every later mount was refused.
 
 `panic = "abort"` makes this sharper than it looks: a panic does not fail an
 operation, it ends the instance. An embedded app cannot recover from one, so
@@ -158,7 +162,7 @@ Not bugs; things to design around.
 
 | Constraint | Consequence |
 |---|---|
-| **WebGPU only.** No WebGL2 feature, and the consumer's pipeline is compute-shader based anyway. | Hard browser requirement. Detect `navigator.gpu` and refuse with a message rather than mounting something that will never draw. |
+| **WebGPU only.** No WebGL2 feature, and the consumer's pipeline is compute-shader based anyway. | Hard browser requirement. Detect `navigator.gpu` and refuse with a message rather than mounting something that will never draw. That check cannot see a browser with `navigator.gpu` but no adapter to give (Firefox on a blocklisted driver, or with hardware acceleration off), so pass `on_backend_error` too. |
 | **One event loop per process.** | One pebble app per wasm module. Teardown is asynchronous, so a host that remounts must serialise against it. |
 | **No text, no 2D drawing, no debug draw, no UI.** Deliberate — pebble gives primitives. | The consumer's transfer-function editor is ~1100 lines of hand-rolled WGSL because there was no other option. |
 | **`build_material` hardcodes `TriangleList`,** and `PolygonMode::Line` needs a native-only feature. | No line-list pipeline on the web. Draw lines as SDF-shaded quads. |
