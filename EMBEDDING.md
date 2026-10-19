@@ -93,6 +93,18 @@ to hold a `Redraw` and request a frame until it resolves. `maintain_gpu` drives
 `Device::poll` once per tick and is subject to exactly the same condition: no
 tick, no map callbacks, no resolution.
 
+### Adapter fallback
+
+GPU acquisition tries the normal adapter/device first. If either request fails,
+it retries once with `force_fallback_adapter: true` and negotiates optional
+features against that new adapter. This can use a CPU implementation and is
+therefore a last resort. Development tracing reports the failure, selected
+adapter, granted features and device limits.
+
+If both attempts fail, `on_backend_error` receives both reasons once and the app
+exits. Browser builds require a wgpu version that forwards the fallback option
+to JavaScript; wgpu 30.0.1 needs that mapping patched by the consumer.
+
 ### 3. Be told things from outside the ECS
 
 `AppHandle` (from `feat/stream-and-app-handle`) is the supported channel: get one

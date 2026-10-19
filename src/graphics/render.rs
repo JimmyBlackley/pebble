@@ -93,6 +93,8 @@ pub enum BackendError {
     Device(String),
     /// The surface offers no non-sRGB format, which this renderer needs.
     SurfaceFormat(String),
+    /// Both the preferred adapter/device and the software fallback failed.
+    Fallback { primary: String, fallback: String },
 }
 
 impl std::fmt::Display for BackendError {
@@ -104,6 +106,10 @@ impl std::fmt::Display for BackendError {
             Self::SurfaceFormat(formats) => {
                 write!(f, "the surface offers no non-sRGB format (got {formats})")
             }
+            Self::Fallback { primary, fallback } => write!(
+                f,
+                "normal GPU initialization failed ({primary}); fallback initialization also failed ({fallback})"
+            ),
         }
     }
 }
@@ -165,6 +171,64 @@ pub struct GPUReceiver {
     promise: Promise<Result<Backend, BackendError>>,
 }
 
+async fn with_adapter_fallback<T, F, Fut>(mut acquire: F) -> Result<T, BackendError>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<T, BackendError>>,
+{
+    match acquire(false).await {
+        Ok(value) => Ok(value),
+        Err(primary) => {
+            tracing::warn!(
+                "normal GPU initialization failed: {primary}; trying a fallback adapter"
+            );
+            acquire(true)
+                .await
+                .map_err(|fallback| BackendError::Fallback {
+                    primary: primary.to_string(),
+                    fallback: fallback.to_string(),
+                })
+        }
+    }
+}
+
+async fn acquire_device(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+    features: DeviceFeatures,
+    fallback: bool,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue, wgpu::Features), BackendError> {
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: if fallback {
+                wgpu::PowerPreference::None
+            } else {
+                wgpu::PowerPreference::HighPerformance
+            },
+            compatible_surface: Some(surface),
+            force_fallback_adapter: fallback,
+            apply_limit_buckets: true,
+        })
+        .await
+        .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
+    let required_features = Into::<wgpu::Features>::into(features) & adapter.features();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| BackendError::Device(e.to_string()))?;
+    tracing::info!(
+        fallback_requested = fallback,
+        adapter = ?adapter.get_info(),
+        features = ?required_features,
+        limits = ?device.limits(),
+        "GPU device acquired"
+    );
+    Ok((adapter, device, queue, required_features))
+}
+
 /// Acquire the GPU, or say why it could not be.
 ///
 /// Fallible rather than panicking because the most likely reason to fail is a
@@ -181,28 +245,13 @@ async fn init_gpu(
         .create_surface(window.clone())
         .map_err(|e| BackendError::Surface(e.to_string()))?;
 
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: true,
-        })
-        .await
-        .map_err(|e| BackendError::NoAdapter(e.to_string()))?;
-
     // Best-effort: an optional feature the adapter doesn't support is
     // dropped rather than failing device creation. `Backend::features`
     // reports what was actually granted.
-    let required_features =
-        Into::<wgpu::Features>::into(config.features) & adapter.features();
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            required_features,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| BackendError::Device(e.to_string()))?;
+    let (adapter, device, queue, required_features) = with_adapter_fallback(|fallback| {
+        acquire_device(&instance, &surface, config.features, fallback)
+    })
+    .await?;
 
     // On the web the window may not have a size yet (see `web_canvas_size`)
     // — a zero configure is invalid, so clamp; `begin_frame` reconfigures to
@@ -340,7 +389,10 @@ fn web_canvas_size(window: &Window) -> Option<(u32, u32)> {
     let canvas = window.raw().canvas()?;
     let rect = canvas.get_bounding_client_rect();
     let scale = web_sys::window()?.device_pixel_ratio();
-    let (width, height) = ((rect.width() * scale) as u32, (rect.height() * scale) as u32);
+    let (width, height) = (
+        (rect.width() * scale) as u32,
+        (rect.height() * scale) as u32,
+    );
     (width > 0 && height > 0).then_some((width, height))
 }
 
@@ -414,6 +466,55 @@ mod tests {
 
     use super::*;
     use crate::{app::App, ecs::system::SystemStage};
+
+    #[test]
+    fn successful_primary_does_not_request_fallback() {
+        let mut attempts = Vec::new();
+        let result = pollster::block_on(with_adapter_fallback(|fallback| {
+            attempts.push(fallback);
+            std::future::ready(Ok(42))
+        }));
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts, [false]);
+    }
+
+    #[test]
+    fn missing_adapter_and_denied_device_both_try_fallback() {
+        for device_denied in [false, true] {
+            let mut attempts = Vec::new();
+            let result = pollster::block_on(with_adapter_fallback(|fallback| {
+                attempts.push(fallback);
+                std::future::ready(if fallback {
+                    Ok(42)
+                } else if device_denied {
+                    Err(BackendError::Device("primary device rejected".into()))
+                } else {
+                    Err(BackendError::NoAdapter(
+                        "primary adapter unavailable".into(),
+                    ))
+                })
+            }));
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(attempts, [false, true]);
+        }
+    }
+
+    #[test]
+    fn both_failures_preserve_the_causes_without_retrying_forever() {
+        let mut attempts = Vec::new();
+        let result: Result<(), _> = pollster::block_on(with_adapter_fallback(|fallback| {
+            attempts.push(fallback);
+            std::future::ready(Err(if fallback {
+                BackendError::Device("fallback device rejected".into())
+            } else {
+                BackendError::NoAdapter("primary adapter unavailable".into())
+            }))
+        }));
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("primary adapter unavailable"));
+        assert!(message.contains("fallback device rejected"));
+        assert_eq!(attempts, [false, true]);
+    }
 
     #[derive(Default)]
     struct Observed {
